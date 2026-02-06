@@ -48,18 +48,32 @@ def test_set_comment_roundtrip():
 # ============================================================================
 
 
-@test(skip=True)  # Skip by default as it modifies the database
-def test_patch_asm():
-    """patch_asm can patch assembly"""
+@test()
+def test_patch_asm_roundtrip():
+    """patch_asm can patch assembly and be restored"""
     fn_addr = get_any_function()
     if not fn_addr:
         return
 
-    # This is a risky test - patching assembly could corrupt the binary
-    result = patch_asm({"addr": fn_addr, "asm": "nop"})
-    assert_is_list(result, min_length=1)
-    r = result[0]
-    assert_has_keys(r, "addr", "error")
+    # Import memory functions for backup/restore
+    from ..api_memory import get_bytes, patch
+
+    # Read original bytes (enough for a nop instruction)
+    original = get_bytes({"addr": fn_addr, "size": 16})
+    assert_is_list(original, min_length=1)
+    original_data = original[0].get("data")
+    if not original_data:
+        return
+
+    try:
+        # Patch with nop
+        result = patch_asm({"addr": fn_addr, "asm": "nop"})
+        assert_is_list(result, min_length=1)
+        r = result[0]
+        assert_has_keys(r, "addr")
+    finally:
+        # Restore original bytes
+        patch({"addr": fn_addr, "data": original_data})
 
 
 # ============================================================================
@@ -112,18 +126,28 @@ def test_rename_global_roundtrip():
         pass  # May fail if no suitable global exists
 
 
-@test(skip=True)  # Local variable renaming requires decompilation
-def test_rename_local_roundtrip():
-    """rename local variable works"""
+@test()
+def test_rename_local_error_handling():
+    """rename local variable handles errors gracefully"""
     fn_addr = get_any_function()
     if not fn_addr:
         return
 
-    # This requires the function to be decompilable and have local variables
+    # Try to rename a non-existent local variable - should return error, not crash
     result = rename(
-        {"local": [{"func": fn_addr, "name": "old_var", "new_name": "__test_local__"}]}
+        {
+            "local": [
+                {
+                    "func": fn_addr,
+                    "name": "__nonexistent_var__",
+                    "new_name": "__test_local__",
+                }
+            ]
+        }
     )
     assert isinstance(result, dict)
+    # Should have local key with results
+    assert "local" in result
 
 
 # ============================================================================
@@ -131,25 +155,43 @@ def test_rename_local_roundtrip():
 # ============================================================================
 
 
-@test(skip=True)  # Skip by default as it modifies the database
+@test()
 def test_define_undefine_func_roundtrip():
-    """define_func and undefine work together"""
-    # Get a data address where we might be able to create a function
-    data_addr = get_data_address()
-    if not data_addr:
+    """define_func and undefine work together - undefine existing func then redefine"""
+    import ida_funcs
+    import idaapi
+
+    # Get an existing function to test with
+    fn_addr = get_any_function()
+    if not fn_addr:
         return
 
-    # Try to create a function (may fail if not valid code)
-    result = define_func({"addr": data_addr})
-    assert_is_list(result, min_length=1)
-    r = result[0]
-    assert_has_keys(r, "addr")
+    fn_ea = int(fn_addr, 16)
+    func = idaapi.get_func(fn_ea)
+    if not func:
+        return
 
-    # If creation succeeded, undefine it
-    if r.get("ok"):
-        undef_result = undefine({"addr": data_addr})
+    # Save function bounds for restoration
+    start_ea = func.start_ea
+    end_ea = func.end_ea
+
+    try:
+        # Undefine the function
+        undef_result = undefine({"addr": fn_addr, "end": hex(end_ea)})
         assert_is_list(undef_result, min_length=1)
-        assert undef_result[0].get("ok") is True
+
+        # Verify function is gone
+        assert idaapi.get_func(start_ea) is None
+
+        # Re-define the function with explicit bounds
+        result = define_func({"addr": hex(start_ea), "end": hex(end_ea)})
+        assert_is_list(result, min_length=1)
+        r = result[0]
+        assert r.get("ok") is True or r.get("error") is None
+    finally:
+        # Ensure function is restored even if test fails
+        if idaapi.get_func(start_ea) is None:
+            ida_funcs.add_func(start_ea, end_ea)
 
 
 @test()
@@ -178,17 +220,24 @@ def test_define_func_batch():
     assert_is_list(result, min_length=2)
 
 
-@test(skip=True)  # Skip by default as it modifies the database
-def test_define_code():
-    """define_code converts bytes to instructions"""
-    data_addr = get_data_address()
-    if not data_addr:
+@test()
+def test_define_code_on_existing_code():
+    """define_code handles already-defined code gracefully"""
+    # Get an existing function address - it's already code
+    fn_addr = get_any_function()
+    if not fn_addr:
         return
 
-    result = define_code({"addr": data_addr})
+    # Calling define_code on existing code should succeed (it's idempotent)
+    # or return an appropriate response
+    result = define_code({"addr": fn_addr})
     assert_is_list(result, min_length=1)
     r = result[0]
     assert_has_keys(r, "addr")
+    # Should either succeed or have a meaningful response
+    assert (
+        r.get("ok") is True or r.get("length") is not None or r.get("error") is not None
+    )
 
 
 @test()
