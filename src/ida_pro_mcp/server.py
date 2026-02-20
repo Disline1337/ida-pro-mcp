@@ -3,12 +3,13 @@ import sys
 import json
 import shutil
 import argparse
-import http.client
+import asyncio
+import threading
 import tempfile
 import traceback
 import tomllib
 import tomli_w
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 import glob
 
@@ -16,72 +17,474 @@ if TYPE_CHECKING:
     from ida_pro_mcp.ida_mcp.zeromcp import McpServer
     from ida_pro_mcp.ida_mcp.zeromcp.jsonrpc import JsonRpcResponse, JsonRpcRequest
 else:
+    # Pre-load stdlib http before adding ida_mcp/ to sys.path, otherwise
+    # ida_mcp/http.py shadows the stdlib http package and breaks imports.
+    import http.server  # noqa: F401
+
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "ida_mcp"))
     from zeromcp import McpServer
     from zeromcp.jsonrpc import JsonRpcResponse, JsonRpcRequest
 
     sys.path.pop(0)  # Clean up
 
-IDA_HOST = "127.0.0.1"
-IDA_PORT = 13337
+WS_HOST = "127.0.0.1"
+WS_PORT = 13336
+
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+IDA_PLUGIN_PKG = os.path.join(SCRIPT_DIR, "ida_mcp")
+IDA_PLUGIN_LOADER = os.path.join(SCRIPT_DIR, "ida_mcp.py")
 
 mcp = McpServer("ida-pro-mcp")
 dispatch_original = mcp.registry.dispatch
 
 
+# ============================================================================
+# Instance Registry
+# ============================================================================
+
+class InstanceInfo:
+    """Represents a connected IDA Pro instance."""
+    def __init__(self, client_id: str, ws, metadata: dict):
+        self.client_id = client_id
+        self.ws = ws  # websockets connection
+        self.module: str = metadata.get("module", "unknown")
+        self.arch: str = metadata.get("arch", "unknown")
+        self.base: str = metadata.get("base", "0x0")
+        self.port: int = metadata.get("port", 0)
+        self.metadata = metadata
+        self._request_id = 0
+        self._pending: dict[int, threading.Event] = {}
+        self._responses: dict[int, Any] = {}
+        self._lock = threading.Lock()
+
+    def next_request_id(self) -> int:
+        with self._lock:
+            self._request_id += 1
+            return self._request_id
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.client_id,
+            "module": self.module,
+            "arch": self.arch,
+            "base": self.base,
+        }
+
+
+instances: dict[str, InstanceInfo] = {}
+instances_lock = threading.Lock()
+
+
+# ============================================================================
+# Instance param injection
+# ============================================================================
+
+INSTANCE_PARAM = {
+    "type": "string",
+    "description": "Target IDA instance (module name or ID from list_instances)",
+}
+
+
+def _inject_instance_param(tool_schema: dict) -> None:
+    """Add required `instance` parameter to a tool's inputSchema."""
+    input_schema = tool_schema.get("inputSchema", {})
+    properties = input_schema.get("properties", {})
+    if "instance" not in properties:
+        properties["instance"] = INSTANCE_PARAM
+        input_schema["properties"] = properties
+        required = input_schema.get("required", [])
+        required.insert(0, "instance")
+        input_schema["required"] = required
+
+
+# ============================================================================
+# Static tool schema extraction (AST-based, no IDA imports needed)
+# ============================================================================
+
+def _parse_tools_from_source() -> list[dict]:
+    """Parse @tool function schemas from api_*.py files using AST.
+
+    Extracts function name, docstring, and parameter info (from Annotated types)
+    without importing any IDA modules.
+    """
+    import ast as _ast
+
+    api_dir = os.path.join(SCRIPT_DIR, "ida_mcp")
+    tools = []
+
+    for filename in sorted(os.listdir(api_dir)):
+        if not filename.startswith("api_") or not filename.endswith(".py"):
+            continue
+
+        filepath = os.path.join(api_dir, filename)
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                tree = _ast.parse(f.read(), filename)
+        except Exception:
+            continue
+
+        for node in _ast.walk(tree):
+            if not isinstance(node, _ast.FunctionDef):
+                continue
+
+            # Check if decorated with @tool
+            is_tool = False
+            for dec in node.decorator_list:
+                if isinstance(dec, _ast.Name) and dec.id == "tool":
+                    is_tool = True
+                    break
+            if not is_tool:
+                continue
+
+            # Extract docstring (first line only)
+            docstring = _ast.get_docstring(node) or f"Call {node.name}"
+            description = docstring.strip().split("\n")[0].strip()
+
+            # Extract parameters
+            properties = {}
+            required = []
+
+            for arg in node.args.args:
+                param_name = arg.arg
+                if param_name in ("self", "cls"):
+                    continue
+
+                param_schema: dict = {"type": "string"}
+
+                # Try to extract description from Annotated[..., "desc"]
+                annotation = arg.annotation
+                if annotation and isinstance(annotation, _ast.Subscript):
+                    # Annotated[type, "description"]
+                    if isinstance(annotation.value, _ast.Name) and annotation.value.id == "Annotated":
+                        if isinstance(annotation.slice, _ast.Tuple):
+                            elts = annotation.slice.elts
+                            if len(elts) >= 2:
+                                # Get description from last element
+                                desc_node = elts[-1]
+                                if isinstance(desc_node, _ast.Constant) and isinstance(desc_node.value, str):
+                                    param_schema["description"] = desc_node.value
+
+                                # Get type from first element
+                                type_node = elts[0]
+                                param_schema["type"] = _ast_type_to_json(type_node)
+
+                properties[param_name] = param_schema
+
+                # Check if parameter has a default value
+                # defaults are right-aligned to args
+                n_args = len(node.args.args)
+                n_defaults = len(node.args.defaults)
+                arg_index = node.args.args.index(arg)
+                has_default = arg_index >= (n_args - n_defaults)
+                if not has_default:
+                    required.append(param_name)
+
+            tool_schema = {
+                "name": node.name,
+                "description": description,
+                "inputSchema": {
+                    "type": "object",
+                    "properties": properties,
+                    "required": required,
+                },
+            }
+            tools.append(tool_schema)
+
+    return tools
+
+
+def _ast_type_to_json(node) -> str:
+    """Convert an AST type node to a simple JSON schema type string."""
+    import ast as _ast
+
+    if isinstance(node, _ast.Name):
+        return {
+            "str": "string",
+            "int": "integer",
+            "float": "number",
+            "bool": "boolean",
+            "list": "array",
+            "dict": "object",
+        }.get(node.id, "string")
+
+    if isinstance(node, _ast.Constant) and isinstance(node.value, str):
+        return "string"
+
+    # For complex types (list[X] | Y, etc.) just use string
+    return "string"
+
+
+# Parse tool schemas at import time (no IDA needed)
+_static_tools: list[dict] = _parse_tools_from_source()
+for _t in _static_tools:
+    _inject_instance_param(_t)
+
+
+# ============================================================================
+# WebSocket Server
+# ============================================================================
+
+_ws_loop: asyncio.AbstractEventLoop | None = None
+_ws_thread: threading.Thread | None = None
+
+
+def _send_ws_request_sync(instance: InstanceInfo, request_data: dict) -> dict:
+    """Send a JSON-RPC request through WebSocket and wait for response synchronously.
+
+    Schedules the WS send on the asyncio loop, then blocks on a threading.Event
+    for the response (which arrives via the WS receive loop on the asyncio thread).
+    """
+    if _ws_loop is None:
+        raise RuntimeError("WebSocket server not running")
+
+    req_id = instance.next_request_id()
+    request_data = {**request_data, "_ws_id": req_id}
+
+    event = threading.Event()
+    with instance._lock:
+        instance._pending[req_id] = event
+
+    try:
+        # Schedule the send on the asyncio event loop
+        send_future = asyncio.run_coroutine_threadsafe(
+            instance.ws.send(json.dumps(request_data)), _ws_loop
+        )
+        send_future.result(timeout=10)  # Wait for send to complete
+
+        # Block until response arrives (set by _handle_ws_client receive loop)
+        if not event.wait(timeout=120):
+            raise TimeoutError("IDA instance did not respond within 120 seconds")
+        with instance._lock:
+            return instance._responses.pop(req_id)
+    finally:
+        with instance._lock:
+            instance._pending.pop(req_id, None)
+            instance._responses.pop(req_id, None)
+
+
+async def _handle_ws_client(websocket):
+    """Handle a single WebSocket client (IDA instance) connection."""
+    client_id: str | None = None
+
+    try:
+        # First message must be a register message
+        raw = await websocket.recv()
+        msg = json.loads(raw)
+
+        if msg.get("type") != "register":
+            await websocket.close(1002, "First message must be 'register'")
+            return
+
+        client_id = msg.get("client_id", "")
+        metadata = msg.get("metadata", {})
+        info = InstanceInfo(client_id, websocket, metadata)
+
+        with instances_lock:
+            instances[client_id] = info
+
+        module = metadata.get("module", "unknown")
+        print(f"[MCP] IDA instance connected: {module} ({client_id})", file=sys.stderr)
+
+        # Receive loop: handle responses from IDA
+        async for raw in websocket:
+            msg = json.loads(raw)
+            ws_id = msg.pop("_ws_id", None)
+            if ws_id is not None:
+                with info._lock:
+                    info._responses[ws_id] = msg
+                    event = info._pending.get(ws_id)
+                    if event:
+                        event.set()
+
+    except Exception as e:
+        if client_id:
+            print(f"[MCP] IDA instance error ({client_id}): {e}", file=sys.stderr)
+    finally:
+        if client_id:
+            with instances_lock:
+                instances.pop(client_id, None)
+            print(f"[MCP] IDA instance disconnected: {client_id}", file=sys.stderr)
+
+
+async def _run_ws_server(host: str, port: int):
+    """Run the WebSocket server."""
+    import websockets
+    async with websockets.serve(_handle_ws_client, host, port):
+        print(f"[MCP] WebSocket server listening on {host}:{port}", file=sys.stderr)
+        await asyncio.Future()  # run forever
+
+
+def start_ws_server(host: str, port: int):
+    """Start the WebSocket server in a background thread."""
+    global _ws_loop, _ws_thread
+
+    def run():
+        global _ws_loop
+        _ws_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(_ws_loop)
+        _ws_loop.run_until_complete(_run_ws_server(host, port))
+
+    _ws_thread = threading.Thread(target=run, daemon=True)
+    _ws_thread.start()
+
+
+# ============================================================================
+# Local tools
+# ============================================================================
+
+LOCAL_TOOLS = [
+    {
+        "name": "list_instances",
+        "description": "List all connected IDA Pro instances. Call this first to get instance IDs/module names for other tools.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+]
+
+
+def handle_list_instances() -> dict:
+    """Handle the list_instances tool call."""
+    with instances_lock:
+        result = [info.to_dict() for cid, info in instances.items()]
+    return {
+        "content": [{"type": "text", "text": json.dumps(result, indent=2)}],
+        "structuredContent": {"result": result},
+        "isError": False,
+    }
+
+
+def _resolve_instance(instance_key: str) -> InstanceInfo | None:
+    """Resolve an instance by ID or module name. Returns None if not found."""
+    with instances_lock:
+        # Auto-select if only one instance connected
+        if not instance_key and len(instances) == 1:
+            return next(iter(instances.values()))
+        # Exact ID match
+        if instance_key in instances:
+            return instances[instance_key]
+        # Module name match (case-insensitive)
+        for cid, info in instances.items():
+            if info.module.lower() == instance_key.lower():
+                return info
+    return None
+
+
+# ============================================================================
+# Dispatch proxy: route requests through WebSocket
+# ============================================================================
+
 def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse | None:
-    """Dispatch JSON-RPC requests to the MCP server registry"""
+    """Dispatch JSON-RPC requests: local handling or WS routing to IDA."""
     if not isinstance(request, dict):
         request_obj: JsonRpcRequest = json.loads(request)
     else:
         request_obj: JsonRpcRequest = request  # type: ignore
 
-    if request_obj["method"] == "initialize":
+    method = request_obj.get("method", "")
+
+    # Handle locally: initialize, notifications
+    if method == "initialize":
         return dispatch_original(request)
-    elif request_obj["method"].startswith("notifications/"):
+    if method.startswith("notifications/"):
         return dispatch_original(request)
 
-    conn = http.client.HTTPConnection(IDA_HOST, IDA_PORT, timeout=30)
-    try:
-        if isinstance(request, dict):
-            request = json.dumps(request)
-        elif isinstance(request, str):
-            request = request.encode("utf-8")
-        conn.request("POST", "/mcp", request, {"Content-Type": "application/json"})
-        response = conn.getresponse()
-        data = response.read().decode()
-        return json.loads(data)
-    except Exception as e:
-        full_info = traceback.format_exc()
-        id = request_obj.get("id")
-        if id is None:
-            return None  # Notification, no response needed
+    # Handle tools/call
+    if method == "tools/call":
+        params = request_obj.get("params", {})
+        tool_name = params.get("name", "") if isinstance(params, dict) else ""
+        tool_args = params.get("arguments", {}) if isinstance(params, dict) else {}
 
-        if sys.platform == "darwin":
-            shortcut = "Ctrl+Option+M"
-        else:
-            shortcut = "Ctrl+Alt+M"
-        return JsonRpcResponse(
-            {
+        # Local tool: list_instances
+        if tool_name == "list_instances":
+            request_id = request_obj.get("id")
+            return {
+                "jsonrpc": "2.0",
+                "result": handle_list_instances(),
+                "id": request_id,
+            }
+
+        # All other tools: resolve instance from required `instance` param, forward to IDA
+        instance_key = tool_args.get("instance", "")
+        instance = _resolve_instance(instance_key)
+        if instance is None:
+            request_id = request_obj.get("id")
+            if not instance_key:
+                msg = "Missing required parameter 'instance'. Use list_instances to see connected IDA instances."
+            else:
+                msg = f"Instance not found: '{instance_key}'. Use list_instances to see connected IDA instances."
+            return {
+                "jsonrpc": "2.0",
+                "result": {
+                    "content": [{"type": "text", "text": msg}],
+                    "isError": True,
+                },
+                "id": request_id,
+            }
+
+        # Strip `instance` param before forwarding to IDA
+        forward_args = {k: v for k, v in tool_args.items() if k != "instance"}
+        forward_request = {**request_obj}
+        forward_request["params"] = {**params, "arguments": forward_args}
+        try:
+            return _send_ws_request_sync(instance, forward_request)
+        except Exception as e:
+            request_id = request_obj.get("id")
+            return {
                 "jsonrpc": "2.0",
                 "error": {
                     "code": -32000,
-                    "message": f"Failed to connect to IDA Pro! Did you run Edit -> Plugins -> MCP ({shortcut}) to start the server?\n{full_info}",
-                    "data": str(e),
+                    "message": f"Failed to communicate with IDA instance ({instance.module}): {e}",
                 },
-                "id": id,
+                "id": request_id,
             }
-        )
-    finally:
-        conn.close()
+
+    # Handle tools/list: return statically-parsed tool schemas (always available)
+    if method == "tools/list":
+        request_id = request_obj.get("id")
+        return {
+            "jsonrpc": "2.0",
+            "result": {"tools": LOCAL_TOOLS + _static_tools},
+            "id": request_id,
+        }
+
+    # All other requests: route to first available instance
+    with instances_lock:
+        instance = next(iter(instances.values()), None) if instances else None
+
+    if instance is None:
+        request_id = request_obj.get("id")
+        if request_id is None:
+            return None
+        return {
+            "jsonrpc": "2.0",
+            "error": {
+                "code": -32000,
+                "message": "No IDA instances connected.",
+            },
+            "id": request_id,
+        }
+
+    try:
+        return _send_ws_request_sync(instance, request_obj)
+    except Exception as e:
+        request_id = request_obj.get("id")
+        if request_id is None:
+            return None
+        return {
+            "jsonrpc": "2.0",
+            "error": {
+                "code": -32000,
+                "message": f"Failed to communicate with IDA instance: {e}",
+            },
+            "id": request_id,
+        }
 
 
 mcp.registry.dispatch = dispatch_proxy
 
-
-SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
-IDA_PLUGIN_PKG = os.path.join(SCRIPT_DIR, "ida_mcp")
-IDA_PLUGIN_LOADER = os.path.join(SCRIPT_DIR, "ida_mcp.py")
 
 # NOTE: This is in the global scope on purpose
 if not os.path.exists(IDA_PLUGIN_PKG):
@@ -152,8 +555,6 @@ def generate_mcp_config(*, stdio: bool):
             "command": get_python_executable(),
             "args": [
                 __file__,
-                "--ida-rpc",
-                f"http://{IDA_HOST}:{IDA_PORT}",
             ],
         }
         env = {}
@@ -162,7 +563,7 @@ def generate_mcp_config(*, stdio: bool):
             mcp_config["env"] = env
         return mcp_config
     else:
-        return {"type": "http", "url": f"http://{IDA_HOST}:{IDA_PORT}/mcp"}
+        return {"type": "http", "url": f"http://{WS_HOST}:{WS_PORT}/mcp"}
 
 
 def print_mcp_config():
@@ -846,7 +1247,7 @@ def install_ida_plugin(
 
 
 def main():
-    global IDA_HOST, IDA_PORT
+    global WS_HOST, WS_PORT
     parser = argparse.ArgumentParser(description="IDA Pro MCP Server")
     parser.add_argument(
         "--install", action="store_true", help="Install the MCP Server and IDA plugin"
@@ -868,22 +1269,17 @@ def main():
         help="MCP transport protocol to use (stdio or http://127.0.0.1:8744)",
     )
     parser.add_argument(
-        "--ida-rpc",
-        type=str,
-        default=f"http://{IDA_HOST}:{IDA_PORT}",
-        help=f"IDA RPC server to use (default: http://{IDA_HOST}:{IDA_PORT})",
+        "--ws-port",
+        type=int,
+        default=WS_PORT,
+        help=f"WebSocket server port for IDA connections (default: {WS_PORT})",
     )
     parser.add_argument(
         "--config", action="store_true", help="Generate MCP config JSON"
     )
     args = parser.parse_args()
 
-    # Parse IDA RPC server argument
-    ida_rpc = urlparse(args.ida_rpc)
-    if ida_rpc.hostname is None or ida_rpc.port is None:
-        raise Exception(f"Invalid IDA RPC server: {args.ida_rpc}")
-    IDA_HOST = ida_rpc.hostname
-    IDA_PORT = ida_rpc.port
+    WS_PORT = args.ws_port
 
     if args.install and args.uninstall:
         print("Cannot install and uninstall at the same time")
@@ -902,6 +1298,9 @@ def main():
     if args.config:
         print_mcp_config()
         return
+
+    # Start WebSocket server for IDA instances to connect to
+    start_ws_server(WS_HOST, WS_PORT)
 
     try:
         if args.transport == "stdio":
